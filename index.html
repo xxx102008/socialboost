@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SocialBoost — קידום אוטומטי ברשתות</title>
+<style>
+  :root{--bg:#0e1116;--card:#171c24;--line:#252c38;--txt:#e6eaf0;--mut:#8b95a7;--acc:#3b82f6;--ok:#22c55e;--err:#ef4444;--warn:#f59e0b}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt)}
+  header{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0}
+  .wrap{max-width:1000px;margin:0 auto;padding:22px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:18px}
+  label{display:block;font-size:13px;color:var(--mut);margin:10px 0 5px}
+  input,select,button{font:inherit}
+  input,select{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);background:#0b0f14;color:var(--txt)}
+  button{padding:10px 16px;border-radius:9px;border:0;background:var(--acc);color:#fff;cursor:pointer;font-weight:600}
+  button.ghost{background:#222a36}
+  button.sm{padding:6px 11px;font-size:13px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:640px){.row{grid-template-columns:1fr}}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  @media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center}
+  .stat b{display:block;font-size:22px}
+  .stat span{font-size:12px;color:var(--mut)}
+  .bar{height:8px;background:#0b0f14;border-radius:99px;overflow:hidden;margin-top:10px}
+  .bar i{display:block;height:100%;background:var(--acc);width:0;transition:width .4s}
+  .item{border:1px solid var(--line);border-radius:11px;padding:13px;margin-bottom:10px;background:#0b0f14}
+  .item .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
+  .tag{font-size:11px;padding:3px 9px;border-radius:99px;background:#222a36;color:var(--mut)}
+  .tag.run{background:#12331f;color:var(--ok)} .tag.done{background:#132a44;color:#60a5fa}
+  .tag.fail{background:#3a1414;color:var(--err)} .tag.pause{background:#3a2e10;color:var(--warn)}
+  .url{font-size:12px;color:var(--mut);word-break:break-all;margin-top:6px}
+  .muted{color:var(--mut);font-size:13px}
+  .note{font-size:12px;color:var(--mut);margin-top:8px;line-height:1.6}
+</style>
+</head>
+<body>
+<header>
+  <h1>SocialBoost</h1>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input id="api" placeholder="כתובת הבק`נד (https://...)" style="width:280px">
+    <button class="sm ghost" onclick="saveApi()">שמור</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 4px">קמפיין חדש</h3>
+    <p class="muted" style="margin:0">הדבק קישור, בחר פעולה וכמות — המערכת תיצור משימות ותבצע אותן.</p>
+    <label>קישור</label>
+    <input id="url" placeholder="https://www.youtube.com/watch?v=...">
+    <div class="row">
+      <div><label>פלטפורמה</label>
+        <select id="platform">
+          <option value="">זהה אוטומטית</option>
+          <option value="youtube">YouTube</option>
+          <option value="instagram">Instagram</option>
+          <option value="tiktok">TikTok</option>
+          <option value="facebook">Facebook</option>
+        </select></div>
+      <div><label>פעולה</label>
+        <select id="action">
+          <option value="like">לייקים</option>
+          <option value="view">צפיות</option>
+          <option value="subscribe">מנויים</option>
+          <option value="follow">עוקבים</option>
+          <option value="comment">תגובות</option>
+        </select></div>
+    </div>
+    <div class="row">
+      <div><label>כמות</label><input id="qty" type="number" value="10" min="1"></div>
+      <div><label>טקסט תגובה (אופציונלי)</label><input id="comment" placeholder="Great video!"></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
+      <button onclick="createCampaign()">צור קמפיין</button>
+      <span class="muted" id="msg"></span>
+    </div>
+    <p class="note">שים לב: יצירת חשבונות אוטומטית דורשת שדפדפן ה-worker ירוץ עם Playwright. כמות גדולה = זמן רב.</p>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">הקמפיינים שלי</h3>
+      <button class="sm ghost" onclick="loadAll()">רענן</button>
+    </div>
+    <div id="list" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">חשבונות</h3>
+      <button class="sm ghost" onclick="loadAccounts()">רענן</button>
+    </div>
+    <div id="accounts" style="margin-top:12px" class="muted">—</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const LS = 'socialboost_api';
+
+function api(){ return ($('api').value || localStorage.getItem(LS) || '').replace(/\/$/,''); }
+function saveApi(){ localStorage.setItem(LS, $('api').value.trim()); $('msg').textContent='נשמר'; setTimeout(()=>$('msg').textContent='',1500); }
+$('api').value = localStorage.getItem(LS) || '';
+
+async function call(path, opts={}){
+  const base = api();
+  if(!base) throw new Error('הגדר כתובת בק`נד למעלה');
+  const r = await fetch(base + path, {headers:{'Content-Type':'application/json'}, ...opts});
+  if(!r.ok){ let d; try{ d=(await r.json()).detail }catch(e){} throw new Error(d||('שגיאה '+r.status)); }
+  return r.status===204? null : r.json();
+}
+
+async function createCampaign(){
+  $('msg').textContent='יוצר...';
+  try{
+    await call('/api/campaigns',{method:'POST',body:JSON.stringify({
+      url:$('url').value, platform:$('platform').value||null, action:$('action').value,
+      quantity:parseInt($('qty').value||'1'), comment_text:$('comment').value||null
+    })});
+    $('msg').textContent='נוצר בהצלחה';
+    $('url').value=''; loadAll();
+  }catch(e){ $('msg').textContent=e.message; }
+  setTimeout(()=>$('msg').textContent='',3000);
+}
+
+const TAG = {running:['רץ','run'],completed:['הושלם','done'],failed:['נכשל','fail'],
+             paused:['מושהה','pause'],cancelled:['בוטל','fail'],draft:['טיוטה','']};
+
+async function loadAll(){
+  try{
+    const [stats, camps] = await Promise.all([call('/api/dashboard'), call('/api/campaigns')]);
+    $('stats').innerHTML = `
+      <div class="stat"><b>${stats.total_campaigns}</b><span>קמפיינים</span></div>
+      <div class="stat"><b>${stats.total_tasks}</b><span>משימות</span></div>
+      <div class="stat"><b style="color:var(--ok)">${stats.completed_tasks}</b><span>הושלמו</span></div>
+      <div class="stat"><b style="color:var(--err)">${stats.failed_tasks}</b><span>נכשלו</span></div>`;
+    $('list').innerHTML = camps.length ? camps.map(c=>{
+      const [t,cls]=TAG[c.status]||['',''];
+      const pct = c.target_quantity? Math.round(100*c.success_count/c.target_quantity):0;
+      return `<div class="item">
+        <div class="top">
+          <div><b>${c.platform}</b> · ${c.action_type} · יעד ${c.target_quantity}</div>
+          <span class="tag ${cls}">${t}</span>
+        </div>
+        <div class="url">${c.target_url}</div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+          <span class="muted">${c.success_count}/${c.target_quantity} אומתו · ${c.failed_count} נכשלו</span>
+          <button class="sm ghost" onclick="campaignAction('${c.id}','pause')">השהה</button>
+          <button class="sm ghost" onclick="campaignAction('${c.id}','cancel')">בטל</button>
+        </div>
+      </div>`;
+    }).join('') : '<div class="muted">אין קמפיינים עדיין</div>';
+  }catch(e){ $('list').innerHTML = `<div class="muted">${e.message}</div>`; }
+}
+
+async function campaignAction(id, a){ try{ await call(`/api/campaigns/${id}/${a}`,{method:'POST'}); loadAll(); }catch(e){ alert(e.message); } }
+
+async function loadAccounts(){
+  try{
+    const accs = await call('/api/accounts');
+    $('accounts').innerHTML = accs.length ? accs.map(a=>
+      `<div class="item"><div class="top"><div>${a.platform} · ${a.email}</div><span class="tag">${a.status}</span></div></div>`
+    ).join('') : 'אין חשבונות';
+  }catch(e){ $('accounts').innerHTML = e.message; }
+}
+
+loadAll(); loadAccounts();
+setInterval(loadAll, 8000);
+</script>
+</body>
+</html>

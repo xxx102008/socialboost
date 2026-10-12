@@ -8,17 +8,22 @@ class Settings(BaseSettings):
 
     app_name: str = "SocialBoost"
     secret_key: str = "change-me-please"
-
     database_url: str = "sqlite:///./data/socialboost.db"
 
     tempmail_providers: str = "mailtm,mailgw"
     tempmail_password: str = "S0cial!Boost#2024"
 
     headless: bool = True
-    worker_poll_seconds: int = 3
-    max_tasks_per_account: int = 1
 
-    allowed_origins: str = "*"
+    # חשוב ל-Free tier: 1 worker = פחות זיכרון
+    worker_concurrency: int = 1
+    worker_poll_seconds: int = 3
+
+    # חוסך זיכרון וזמן - לא טוען תמונות/פונטים
+    block_heavy_assets: bool = True
+
+    step_timeout_ms: int = 30000
+    action_timeout_ms: int = 25000
 
 
 @lru_cache

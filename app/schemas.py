@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import (
     AccountStatus,
@@ -15,12 +15,14 @@ class CampaignCreate(BaseModel):
     platform: Platform | None = None
     url: str
     action: ActionType
-    quantity: int = Field(gt=0, le=100000)
+    quantity: int = Field(ge=0, le=100000)
     comment_text: str | None = None
-    auto_create_accounts: bool = True
+    unlimited: bool = False
 
 
 class CampaignOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     platform: Platform
     target_url: str
@@ -29,13 +31,13 @@ class CampaignOut(BaseModel):
     success_count: int
     failed_count: int
     status: CampaignStatus
+    unlimited: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     status: TaskStatus
     action_type: ActionType
@@ -43,20 +45,17 @@ class TaskOut(BaseModel):
     error: str | None
     account_id: str | None
 
-    class Config:
-        from_attributes = True
-
 
 class AccountOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     platform: Platform
     email: str
     username: str | None
     status: AccountStatus
+    last_error: str | None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class DashboardStats(BaseModel):

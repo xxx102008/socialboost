@@ -25,20 +25,22 @@ def create_campaign(db: Session, payload) -> Campaign:
     if platform is None:
         raise ValueError("לא הצלחתי לזהות את הפלטפורמה מהקישור")
 
+    initial = payload.quantity if payload.quantity > 0 else 1
     campaign = Campaign(
         platform=platform,
         target_url=normalize(payload.url),
         action_type=payload.action,
         target_quantity=payload.quantity,
         comment_text=payload.comment_text,
-        auto_create_accounts=payload.auto_create_accounts,
+        auto_create_accounts=True,
+        unlimited=payload.unlimited,
         status=CampaignStatus.running,
     )
     db.add(campaign)
     db.flush()
 
     pool = _available_accounts(db, platform)
-    for i in range(payload.quantity):
+    for i in range(initial):
         account_id = pool[i].id if i < len(pool) else None
         key = f"{campaign.id}:{account_id or 'new-' + str(i)}:{payload.action.value}"
         db.add(
@@ -75,7 +77,7 @@ def recompute_campaign(db: Session, campaign: Campaign) -> None:
     campaign.failed_count = failed
 
     if campaign.status not in (CampaignStatus.paused, CampaignStatus.cancelled):
-        if pending > 0:
+        if campaign.unlimited or pending > 0:
             campaign.status = CampaignStatus.running
         elif failed > 0 and success == 0:
             campaign.status = CampaignStatus.failed

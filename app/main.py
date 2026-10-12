@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .db import Base, engine, get_db
+from .db import Base, engine, ensure_campaign_unlimited_column, get_db
 from .models import (
     Account,
     AccountStatus,
@@ -16,7 +16,7 @@ from .models import (
     Task,
     TaskStatus,
 )
-from .orchestrator import create_campaign, recompute_campaign
+from .orchestrator import create_campaign
 from .schemas import (
     AccountOut,
     CampaignCreate,
@@ -24,11 +24,12 @@ from .schemas import (
     DashboardStats,
     TaskOut,
 )
-from .worker import Worker
+from .worker import WorkerPool
 
 settings = get_settings()
 
 Base.metadata.create_all(bind=engine)
+ensure_campaign_unlimited_column(engine)
 
 app = FastAPI(title=settings.app_name)
 
@@ -40,20 +41,20 @@ app.add_middleware(
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-worker: Worker | None = None
+pool: WorkerPool | None = None
 
 
 @app.on_event("startup")
 def _startup():
-    global worker
-    worker = Worker()
-    worker.start()
+    global pool
+    pool = WorkerPool()
+    pool.start()
 
 
 @app.on_event("shutdown")
 def _shutdown():
-    if worker:
-        worker.stop()
+    if pool:
+        pool.stop()
 
 
 @app.get("/")
@@ -66,7 +67,6 @@ def health():
     return {"ok": True}
 
 
-# ---------- campaigns ----------
 @app.post("/api/campaigns", response_model=CampaignOut)
 def create(payload: CampaignCreate, db: Session = Depends(get_db)):
     try:
@@ -82,10 +82,10 @@ def list_campaigns(db: Session = Depends(get_db)):
 
 @app.get("/api/campaigns/{cid}", response_model=CampaignOut)
 def get_campaign(cid: str, db: Session = Depends(get_db)):
-    c = db.get(Campaign, cid)
-    if not c:
+    campaign = db.get(Campaign, cid)
+    if not campaign:
         raise HTTPException(404, "קמפיין לא נמצא")
-    return c
+    return campaign
 
 
 @app.get("/api/campaigns/{cid}/tasks", response_model=list[TaskOut])
@@ -94,13 +94,13 @@ def campaign_tasks(cid: str, db: Session = Depends(get_db)):
 
 
 def _set_status(cid: str, status: CampaignStatus, db: Session):
-    c = db.get(Campaign, cid)
-    if not c:
+    campaign = db.get(Campaign, cid)
+    if not campaign:
         raise HTTPException(404, "קמפיין לא נמצא")
-    c.status = status
+    campaign.status = status
     db.commit()
-    db.refresh(c)
-    return c
+    db.refresh(campaign)
+    return campaign
 
 
 @app.post("/api/campaigns/{cid}/pause", response_model=CampaignOut)
@@ -115,23 +115,22 @@ def resume(cid: str, db: Session = Depends(get_db)):
 
 @app.post("/api/campaigns/{cid}/cancel", response_model=CampaignOut)
 def cancel(cid: str, db: Session = Depends(get_db)):
-    c = db.get(Campaign, cid)
-    if not c:
+    campaign = db.get(Campaign, cid)
+    if not campaign:
         raise HTTPException(404, "קמפיין לא נמצא")
-    for t in db.scalars(
+    for task in db.scalars(
         select(Task).where(
             Task.campaign_id == cid,
             Task.status.in_([TaskStatus.pending, TaskStatus.retry]),
         )
     ):
-        t.status = TaskStatus.cancelled
-    c.status = CampaignStatus.cancelled
+        task.status = TaskStatus.cancelled
+    campaign.status = CampaignStatus.cancelled
     db.commit()
-    db.refresh(c)
-    return c
+    db.refresh(campaign)
+    return campaign
 
 
-# ---------- accounts ----------
 @app.get("/api/accounts", response_model=list[AccountOut])
 def list_accounts(db: Session = Depends(get_db)):
     return list(db.scalars(select(Account).order_by(Account.created_at.desc())))
@@ -148,7 +147,9 @@ def dashboard(db: Session = Depends(get_db)):
         total_tasks=count(Task),
         completed_tasks=count(Task, Task.status == TaskStatus.success),
         failed_tasks=count(Task, Task.status == TaskStatus.failed),
-        pending_tasks=count(Task, Task.status.in_([TaskStatus.pending, TaskStatus.retry, TaskStatus.running])),
+        pending_tasks=count(
+            Task, Task.status.in_([TaskStatus.pending, TaskStatus.retry, TaskStatus.running])
+        ),
         total_accounts=count(Account),
         active_accounts=count(Account, Account.status == AccountStatus.active),
     )

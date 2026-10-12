@@ -3,7 +3,7 @@ import threading
 import traceback
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import get_settings
 from .db import SessionLocal
@@ -16,11 +16,12 @@ from .models import (
     Task,
     TaskStatus,
 )
+from .orchestrator import _available_accounts, recompute_campaign
 from .platforms import get_platform
 from .security import encrypt
-from .orchestrator import recompute_campaign
 
 settings = get_settings()
+_claim_lock = threading.Lock()
 
 
 def _now():
@@ -28,16 +29,16 @@ def _now():
 
 
 class Worker(threading.Thread):
-    def __init__(self):
-        super().__init__(daemon=True, name="socialboost-worker")
-        self._stop = threading.Event()
+    def __init__(self, index: int = 0):
+        super().__init__(daemon=True, name=f"sb-worker-{index}")
+        self.index = index
+        self._stop_event = threading.Event()
         self._browser = None
         self._pw = None
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
-    # ---------- browser ----------
     def _browser_instance(self):
         if self._browser is None:
             from playwright.sync_api import sync_playwright
@@ -49,13 +50,17 @@ class Worker(threading.Thread):
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--single-process",
+                    "--no-zygote",
+                    "--js-flags=--max-old-space-size=160",
                 ],
             )
         return self._browser
 
     def _context(self, account=None):
         kwargs = {
-            "viewport": {"width": 1366, "height": 900},
+            "viewport": {"width": 1280, "height": 800},
             "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -65,50 +70,110 @@ class Worker(threading.Thread):
         if account and account.storage_state:
             try:
                 kwargs["storage_state"] = json.loads(account.storage_state)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
-        ctx = self._browser_instance().new_context(**kwargs)
-        ctx.add_init_script(
+
+        context = self._browser_instance().new_context(**kwargs)
+        context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         )
-        return ctx
+        if settings.block_heavy_assets:
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
+        return context
 
-    # ---------- loop ----------
     def run(self):
-        self._requeue_stale()
-        while not self._stop.is_set():
-            try:
-                worked = self._tick()
-            except Exception:
-                traceback.print_exc()
-                worked = False
-            if not worked:
-                self._stop.wait(settings.worker_poll_seconds)
-
-    def _requeue_stale(self):
-        db = SessionLocal()
         try:
-            for t in db.scalars(select(Task).where(Task.status == TaskStatus.running)):
-                t.status = TaskStatus.pending
-            db.commit()
+            while not self._stop_event.is_set():
+                try:
+                    worked = self._tick()
+                except Exception:
+                    traceback.print_exc()
+                    worked = False
+                if not worked:
+                    self._stop_event.wait(settings.worker_poll_seconds)
         finally:
-            db.close()
+            if self._browser is not None:
+                try:
+                    self._browser.close()
+                except Exception:
+                    pass
+            if self._pw is not None:
+                try:
+                    self._pw.stop()
+                except Exception:
+                    pass
 
     def _tick(self) -> bool:
+        """Atomically claim a queued task, or enqueue one unit for an unlimited campaign."""
+        with _claim_lock:
+            db = SessionLocal()
+            try:
+                concurrency = max(1, settings.worker_concurrency)
+                active_count = db.scalar(
+                    select(func.count()).select_from(Task).where(Task.status == TaskStatus.running)
+                ) or 0
+                if active_count >= concurrency:
+                    return False
+
+                task = db.scalar(
+                    select(Task)
+                    .join(Campaign)
+                    .where(
+                        Task.status.in_([TaskStatus.pending, TaskStatus.retry]),
+                        Campaign.status == CampaignStatus.running,
+                    )
+                    .order_by(Task.created_at)
+                    .limit(1)
+                )
+
+                if task is None:
+                    campaign = db.scalar(
+                        select(Campaign)
+                        .where(
+                            Campaign.status == CampaignStatus.running,
+                            Campaign.unlimited.is_(True),
+                        )
+                        .order_by(Campaign.created_at)
+                        .limit(1)
+                    )
+                    if campaign is None:
+                        return False
+
+                    ordinal = db.scalar(
+                        select(func.count()).select_from(Task).where(
+                            Task.campaign_id == campaign.id
+                        )
+                    ) or 0
+                    accounts = _available_accounts(db, campaign.platform)
+                    account_id = accounts[ordinal % len(accounts)].id if accounts else None
+                    task = Task(
+                        campaign_id=campaign.id,
+                        account_id=account_id,
+                        action_type=campaign.action_type,
+                        target_url=campaign.target_url,
+                        idempotency_key=f"unlimited:{campaign.id}:{ordinal}",
+                    )
+                    db.add(task)
+                    db.flush()
+
+                task.status = TaskStatus.running
+                task.started_at = _now()
+                task.attempts += 1
+                db.commit()
+                task_id = task.id
+            finally:
+                db.close()
+
         db = SessionLocal()
         try:
-            task = db.scalar(
-                select(Task)
-                .join(Campaign)
-                .where(
-                    Task.status.in_([TaskStatus.pending, TaskStatus.retry]),
-                    Campaign.status == CampaignStatus.running,
-                )
-                .order_by(Task.created_at)
-                .limit(1)
-            )
+            task = db.get(Task, task_id)
             if task is None:
-                return False
+                return True
             self._process(db, task)
             return True
         finally:
@@ -116,19 +181,24 @@ class Worker(threading.Thread):
 
     def _process(self, db, task: Task):
         campaign = db.get(Campaign, task.campaign_id)
-
-        task.status = TaskStatus.running
-        task.started_at = _now()
-        task.attempts += 1
-        db.commit()
+        if campaign is None:
+            task.status = TaskStatus.failed
+            task.error = "הקמפיין של המשימה לא נמצא"
+            task.finished_at = _now()
+            db.commit()
+            return
 
         account = db.get(Account, task.account_id) if task.account_id else None
         context = None
+        task_id = task.id
+        campaign_id = campaign.id
         try:
             if account is None:
                 account = self._create_account(db, campaign.platform)
                 task.account_id = account.id
                 db.commit()
+                if account.status != AccountStatus.active:
+                    raise RuntimeError(f"יצירת חשבון נכשלה: {account.last_error}")
 
             context = self._context(account)
             result = get_platform(campaign.platform).perform(
@@ -137,8 +207,8 @@ class Worker(threading.Thread):
 
             account.storage_state = encrypt(json.dumps(context.storage_state()))
             account.last_used_at = _now()
-            if account.status != AccountStatus.active:
-                account.status = AccountStatus.active
+            account.status = AccountStatus.active
+            account.last_error = None
 
             task.status = TaskStatus.success
             task.result = result
@@ -146,19 +216,24 @@ class Worker(threading.Thread):
             task.finished_at = _now()
             db.commit()
         except Exception as exc:
-            task.error = str(exc)[:2000]
-            task.status = (
-                TaskStatus.failed if task.attempts >= task.max_attempts else TaskStatus.retry
-            )
-            task.finished_at = _now() if task.status == TaskStatus.failed else None
-            db.commit()
+            db.rollback()
+            task = db.get(Task, task_id)
+            if task is not None:
+                task.error = str(exc)[:2000]
+                task.status = (
+                    TaskStatus.failed if task.attempts >= task.max_attempts else TaskStatus.retry
+                )
+                task.finished_at = _now() if task.status == TaskStatus.failed else None
+                db.commit()
         finally:
-            if context:
+            if context is not None:
                 try:
                     context.close()
                 except Exception:
                     pass
-            recompute_campaign(db, campaign)
+            campaign = db.get(Campaign, campaign_id)
+            if campaign is not None:
+                recompute_campaign(db, campaign)
 
     def _create_account(self, db, platform) -> Account:
         mailbox = create_mailbox()
@@ -188,3 +263,32 @@ class Worker(threading.Thread):
             db.commit()
             db.refresh(account)
         return account
+
+
+class WorkerPool:
+    def __init__(self):
+        self.workers = [
+            Worker(index)
+            for index in range(max(1, settings.worker_concurrency))
+        ]
+
+    def start(self):
+        # Requeue interrupted work once, before any worker begins claiming tasks.
+        db = SessionLocal()
+        try:
+            for task in db.scalars(select(Task).where(Task.status == TaskStatus.running)):
+                task.status = TaskStatus.pending
+                task.started_at = None
+            db.commit()
+        finally:
+            db.close()
+
+        for worker in self.workers:
+            worker.start()
+
+    def stop(self):
+        for worker in self.workers:
+            worker.stop()
+        for worker in self.workers:
+            if worker.is_alive():
+                worker.join(timeout=10)

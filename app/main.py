@@ -41,7 +41,7 @@ app.add_middleware(
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD = "v3-selftest"
+BUILD = "v4-mailproviders"
 pool: WorkerPool | None = None
 
 
@@ -71,6 +71,24 @@ def health():
 @app.get("/api/version")
 def version():
     return {"build": BUILD}
+
+
+@app.get("/api/debug/mailtest")
+def mailtest():
+    """Try every configured mail provider and report provider-level diagnostics."""
+    from .mail import _CREATORS
+
+    output = {}
+    for name, creator in _CREATORS.items():
+        try:
+            mailbox = creator()
+            output[name] = {"ok": True, "address": mailbox.address}
+        except Exception as exc:
+            output[name] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            }
+    return output
 
 
 @app.get("/api/debug/selftest")

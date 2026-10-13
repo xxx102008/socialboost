@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-please"
     database_url: str = "sqlite:///./data/socialboost.db"
 
-    tempmail_providers: str = "mailtm,mailgw"
+    tempmail_providers: str = "tempmail_lol,mailtm,temp_mail_io,temp_mail_org,mailgw"
     tempmail_password: str = "S0cial!Boost#2024"
 
     headless: bool = True

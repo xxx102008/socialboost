@@ -78,12 +78,12 @@ def test_version_and_selftest_endpoints_without_external_services(monkeypatch):
 
     with TestClient(main_module.app) as client:
         assert client.get("/api/health").json() == {"ok": True}
-        assert client.get("/api/version").json() == {"build": "v3-selftest"}
+        assert client.get("/api/version").json() == {"build": "v4-mailproviders"}
         response = client.get("/api/debug/selftest")
 
     assert response.status_code == 200
     result = response.json()
-    assert result["build"] == "v3-selftest"
+    assert result["build"] == "v4-mailproviders"
     assert result["checks"]["tempmail"] == {
         "ok": True,
         "address": "selftest@example.test",

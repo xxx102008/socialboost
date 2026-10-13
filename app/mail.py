@@ -2,101 +2,279 @@ import random
 import re
 import string
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
 from .config import get_settings
 
 settings = get_settings()
-TIMEOUT = 20.0
-
-PROVIDERS = {
-    "mailtm": "https://api.mail.tm",
-    "mailgw": "https://api.mail.gw",
+TIMEOUT = 25.0
+CODE_RE = re.compile(r"\b(\d{4,8})\b")
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
 }
 
-CODE_RE = re.compile(r"\b(\d{4,8})\b")
+
+def _rand(n: int = 10) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
 @dataclass
 class Mailbox:
-    base_url: str
+    provider: str
     address: str
-    password: str
-    token: str
+    handle: dict = field(default_factory=dict)
+
+    @property
+    def password(self) -> str | None:
+        """Keep compatibility with account persistence; token-only providers have no password."""
+        return self.handle.get("password")
+
+    def messages(self) -> list[dict]:
+        reader = _READERS[self.provider]
+        try:
+            return reader(self)
+        except Exception as exc:
+            print(f"[SB] mail read failed ({self.provider}): {type(exc).__name__}: {exc}", flush=True)
+            return []
 
 
-def _client(base_url: str) -> httpx.Client:
-    return httpx.Client(base_url=base_url, timeout=TIMEOUT)
+def _items(data, key: str = "messages") -> list[dict]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for candidate in (key, "hydra:member"):
+            value = data.get(candidate)
+            if isinstance(value, list):
+                return value
+    return []
 
 
-def _random_local() -> str:
-    return "sb" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+# ---------------------- readers ----------------------
+
+
+def _read_lol(mb: Mailbox) -> list[dict]:
+    with httpx.Client(timeout=TIMEOUT, headers=UA) as client:
+        response = client.get(
+            "https://api.tempmail.lol/v2/inbox", params={"token": mb.handle["token"]}
+        )
+        response.raise_for_status()
+        data = response.json()
+    return [
+        {
+            "id": f"lol-{i}-{message.get('date', '')}",
+            "subject": message.get("subject", ""),
+            "text": message.get("body", "") or message.get("text", ""),
+            "html": message.get("html", ""),
+        }
+        for i, message in enumerate(_items(data, "emails"))
+    ]
+
+
+def _read_io(mb: Mailbox) -> list[dict]:
+    with httpx.Client(timeout=TIMEOUT, headers=UA) as client:
+        response = client.get(
+            f"https://api.internal.temp-mail.io/api/v3/email/{mb.address}/messages"
+        )
+        response.raise_for_status()
+        data = response.json()
+    return [
+        {
+            "id": message.get("id") or f"io-{i}",
+            "subject": message.get("subject", ""),
+            "text": message.get("body_text", ""),
+            "html": message.get("body_html", ""),
+        }
+        for i, message in enumerate(_items(data))
+    ]
+
+
+def _read_org(mb: Mailbox) -> list[dict]:
+    with httpx.Client(
+        timeout=TIMEOUT,
+        headers={**UA, "Authorization": f"Bearer {mb.handle['token']}"},
+    ) as client:
+        response = client.get("https://web2.temp-mail.org/messages")
+        response.raise_for_status()
+        data = response.json()
+    return [
+        {
+            "id": message.get("_id") or f"org-{i}",
+            "subject": message.get("subject", ""),
+            "text": message.get("body", "") or message.get("text", ""),
+            "html": message.get("html", ""),
+        }
+        for i, message in enumerate(_items(data))
+    ]
+
+
+def _read_mailtm(mb: Mailbox) -> list[dict]:
+    with httpx.Client(base_url=mb.handle["base"], timeout=TIMEOUT, headers=UA) as client:
+        response = client.get(
+            "/messages", headers={"Authorization": f"Bearer {mb.handle['token']}"}
+        )
+        response.raise_for_status()
+        data = response.json()
+        messages = _items(data)
+        output = []
+        for index, message in enumerate(messages):
+            message_id = message.get("id")
+            text = message.get("text", "")
+            html = message.get("html", "")
+            # mail.tm message lists may omit message bodies; fetch the detail in that case.
+            if message_id and not (text or html):
+                detail_response = client.get(
+                    f"/messages/{message_id}",
+                    headers={"Authorization": f"Bearer {mb.handle['token']}"},
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+                text = detail.get("text", "")
+                html = detail.get("html", "")
+            output.append(
+                {
+                    "id": message_id or f"mailtm-{index}",
+                    "subject": message.get("subject", ""),
+                    "text": text,
+                    "html": html,
+                }
+            )
+    return output
+
+
+# ---------------------- creators ----------------------
+
+
+def _create_lol() -> Mailbox:
+    with httpx.Client(timeout=TIMEOUT, headers=UA) as client:
+        response = client.post("https://api.tempmail.lol/v2/inbox/create", json={})
+        if response.status_code >= 400:
+            response = client.get("https://api.tempmail.lol/v2/inbox/create")
+        response.raise_for_status()
+        data = response.json()
+    address, token = data.get("address"), data.get("token")
+    if not address or not token:
+        raise RuntimeError("tempmail.lol did not return an address and token")
+    return Mailbox("tempmail_lol", address, {"token": token})
+
+
+def _create_io() -> Mailbox:
+    with httpx.Client(timeout=TIMEOUT, headers=UA) as client:
+        response = client.post(
+            "https://api.internal.temp-mail.io/api/v3/email/new",
+            json={"min_name_length": 10, "max_name_length": 10},
+        )
+        response.raise_for_status()
+        data = response.json()
+    address = data.get("email") or data.get("address")
+    if not address:
+        raise RuntimeError("temp-mail.io did not return an email address")
+    handle = {"token": data.get("token")} if data.get("token") else {}
+    return Mailbox("temp_mail_io", address, handle)
+
+
+def _create_org() -> Mailbox:
+    with httpx.Client(timeout=TIMEOUT, headers=UA) as client:
+        response = client.post("https://web2.temp-mail.org/mailbox", json={})
+        response.raise_for_status()
+        data = response.json()
+    address = data.get("mailbox") or data.get("email") or data.get("address")
+    token = data.get("token") or data.get("access_token")
+    if not address or not token:
+        raise RuntimeError("temp-mail.org did not return an address and token")
+    return Mailbox("temp_mail_org", address, {"token": token})
+
+
+def _create_mailtm() -> Mailbox:
+    return _create_mailtm_like("https://api.mail.tm", "mailtm")
+
+
+def _create_mailgw() -> Mailbox:
+    return _create_mailtm_like("https://api.mail.gw", "mailgw")
+
+
+def _create_mailtm_like(base: str, name: str) -> Mailbox:
+    with httpx.Client(base_url=base, timeout=TIMEOUT, headers=UA) as client:
+        domains_response = client.get("/domains")
+        domains_response.raise_for_status()
+        domains_data = domains_response.json()
+        domains = _items(domains_data, "hydra:member")
+        active = [domain["domain"] for domain in domains if domain.get("isActive", True)]
+        if not active:
+            raise RuntimeError("אין דומיין זמין")
+
+        address = f"sb{_rand(10)}@{random.choice(active)}"
+        password = settings.tempmail_password
+        account_response = client.post(
+            "/accounts", json={"address": address, "password": password}
+        )
+        account_response.raise_for_status()
+        token_response = client.post(
+            "/token", json={"address": address, "password": password}
+        )
+        token_response.raise_for_status()
+        token = token_response.json().get("token")
+        if not token:
+            raise RuntimeError(f"{name} did not return an access token")
+    return Mailbox(name, address, {"token": token, "base": base, "password": password})
+
+
+_CREATORS = {
+    "tempmail_lol": _create_lol,
+    "mailtm": _create_mailtm,
+    "temp_mail_io": _create_io,
+    "temp_mail_org": _create_org,
+    "mailgw": _create_mailgw,
+}
+
+_READERS = {
+    "tempmail_lol": _read_lol,
+    "mailtm": _read_mailtm,
+    "mailgw": _read_mailtm,
+    "temp_mail_io": _read_io,
+    "temp_mail_org": _read_org,
+}
+
+
+def _provider_order() -> list[str]:
+    order = [provider.strip() for provider in settings.tempmail_providers.split(",")]
+    configured = [provider for provider in order if provider in _CREATORS]
+    return configured or ["tempmail_lol", "mailtm", "temp_mail_io", "temp_mail_org", "mailgw"]
 
 
 def create_mailbox() -> Mailbox:
-    order = [p.strip() for p in settings.tempmail_providers.split(",") if p.strip()]
-    last_error = None
-
-    for name in order:
-        base_url = PROVIDERS.get(name)
-        if not base_url:
-            continue
+    failures = []
+    for name in _provider_order():
         try:
-            with _client(base_url) as c:
-                domains = c.get("/domains")
-                domains.raise_for_status()
-                active = [d["domain"] for d in domains.json() if d.get("isActive", True)]
-                if not active:
-                    continue
-                address = f"{_random_local()}@{random.choice(active)}"
-                password = settings.tempmail_password
-
-                r = c.post("/accounts", json={"address": address, "password": password})
-                r.raise_for_status()
-
-                t = c.post("/token", json={"address": address, "password": password})
-                t.raise_for_status()
-                return Mailbox(base_url, address, password, t.json()["token"])
+            mailbox = _CREATORS[name]()
+            if mailbox.address:
+                print(f"[SB] mail provider {name} created mailbox", flush=True)
+                return mailbox
+            raise RuntimeError("provider returned an empty address")
         except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"לא הצלחתי ליצור תיבת דואר זמנית: {last_error}")
-
-
-def _messages(mb: Mailbox) -> list[dict]:
-    with _client(mb.base_url) as c:
-        r = c.get("/messages", headers={"Authorization": f"Bearer {mb.token}"})
-        r.raise_for_status()
-        data = r.json()
-        return data.get("hydra:member", data)
-
-
-def _message(mb: Mailbox, msg_id: str) -> dict:
-    with _client(mb.base_url) as c:
-        r = c.get(f"/messages/{msg_id}", headers={"Authorization": f"Bearer {mb.token}"})
-        r.raise_for_status()
-        return r.json()
+            message = f"{name}: {type(exc).__name__}: {str(exc)[:250]}"
+            failures.append(message)
+            print(f"[SB] mail provider {message}", flush=True)
+    raise RuntimeError("כל ספקי הדואר נכשלו: " + "; ".join(failures))
 
 
 def wait_for_code(mb: Mailbox, timeout: int = 150, poll: int = 5) -> str | None:
     deadline = time.time() + timeout
     seen: set[str] = set()
     while time.time() < deadline:
-        try:
-            for msg in _messages(mb):
-                if msg["id"] in seen:
-                    continue
-                seen.add(msg["id"])
-                full = _message(mb, msg["id"])
-                text = full.get("text") or ""
-                html = full.get("html") or ""
-                blob = text + "\n" + (html if isinstance(html, str) else " ".join(html))
-                match = CODE_RE.search(blob)
-                if match:
-                    return match.group(1)
-        except Exception:
-            pass
+        for index, message in enumerate(mb.messages()):
+            message_id = str(message.get("id") or index)
+            if message_id in seen:
+                continue
+            seen.add(message_id)
+            blob = (
+                f"{message.get('subject', '')}\n"
+                f"{message.get('text', '')}\n"
+                f"{message.get('html', '')}"
+            )
+            match = CODE_RE.search(blob)
+            if match:
+                return match.group(1)
         time.sleep(poll)
     return None

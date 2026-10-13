@@ -35,6 +35,9 @@
   .url{font-size:12px;color:var(--mut);word-break:break-all;margin-top:6px}
   .muted{color:var(--mut);font-size:13px}
   .note{font-size:12px;color:var(--mut);margin-top:8px;line-height:1.6}
+  details{margin-top:10px;color:var(--mut);font-size:13px}
+  summary{cursor:pointer}
+  .task-error{color:var(--err);white-space:pre-wrap;word-break:break-word;margin-top:4px}
 </style>
 </head>
 <body>
@@ -47,9 +50,7 @@
 </header>
 
 <div class="wrap">
-  <div class="card">
-    <div class="stats" id="stats"></div>
-  </div>
+  <div class="card"><div class="stats" id="stats"></div></div>
 
   <div class="card">
     <h3 style="margin:0 0 4px">קמפיין חדש</h3>
@@ -75,9 +76,13 @@
         </select></div>
     </div>
     <div class="row">
-      <div><label>כמות</label><input id="qty" type="number" value="10" min="1"></div>
+      <div><label>כמות</label><input id="qty" type="number" value="10" min="0"></div>
       <div><label>טקסט תגובה (אופציונלי)</label><input id="comment" placeholder="Great video!"></div>
     </div>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:12px;color:var(--txt)">
+      <input type="checkbox" id="unlimited" style="width:auto">
+      <span>ללא הגבלה — ירוץ עד שאעצור</span>
+    </label>
     <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
       <button onclick="createCampaign()">צור קמפיין</button>
       <span class="muted" id="msg"></span>
@@ -105,6 +110,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const LS = 'socialboost_api';
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 
 function api(){ return ($('api').value || localStorage.getItem(LS) || '').replace(/\/$/,''); }
 function saveApi(){ localStorage.setItem(LS, $('api').value.trim()); $('msg').textContent='נשמר'; setTimeout(()=>$('msg').textContent='',1500); }
@@ -113,7 +119,12 @@ $('api').value = localStorage.getItem(LS) || '';
 async function call(path, opts={}){
   const base = api();
   if(!base) throw new Error('הגדר כתובת בק`נד למעלה');
-  const r = await fetch(base + path, {headers:{'Content-Type':'application/json'}, ...opts});
+  let r;
+  try{
+    r = await fetch(base + path, {headers:{'Content-Type':'application/json'}, ...opts});
+  }catch(e){
+    throw new Error(`לא ניתן להתחבר לשרת ${base}. בדוק שהכתובת נכונה ושהשירות זמין.`);
+  }
   if(!r.ok){ let d; try{ d=(await r.json()).detail }catch(e){} throw new Error(d||('שגיאה '+r.status)); }
   return r.status===204? null : r.json();
 }
@@ -123,7 +134,8 @@ async function createCampaign(){
   try{
     await call('/api/campaigns',{method:'POST',body:JSON.stringify({
       url:$('url').value, platform:$('platform').value||null, action:$('action').value,
-      quantity:parseInt($('qty').value||'1'), comment_text:$('comment').value||null
+      quantity:parseInt($('qty').value||'1'), comment_text:$('comment').value||null,
+      unlimited:$('unlimited').checked
     })});
     $('msg').textContent='נוצר בהצלחה';
     $('url').value=''; loadAll();
@@ -144,34 +156,64 @@ async function loadAll(){
       <div class="stat"><b style="color:var(--err)">${stats.failed_tasks}</b><span>נכשלו</span></div>`;
     $('list').innerHTML = camps.length ? camps.map(c=>{
       const [t,cls]=TAG[c.status]||['',''];
-      const pct = c.target_quantity? Math.round(100*c.success_count/c.target_quantity):0;
+      const pct = c.target_quantity ? Math.max(0, Math.min(100, Math.round(100*c.success_count/c.target_quantity))) : 0;
+      const target = c.unlimited ? '∞ · ללא הגבלה' : 'יעד ' + c.target_quantity;
+      const progress = c.unlimited ? '' : `<div class="bar"><i style="width:${pct}%"></i></div>`;
+      const resultCount = c.unlimited
+        ? `${c.success_count} בוצעו · ${c.failed_count} נכשלו`
+        : `${c.success_count}/${c.target_quantity} אומתו · ${c.failed_count} נכשלו`;
+      const pauseAction = c.status === 'paused' ? 'resume' : 'pause';
+      const pauseLabel = c.status === 'paused' ? 'חדש' : 'השהה';
       return `<div class="item">
         <div class="top">
-          <div><b>${c.platform}</b> · ${c.action_type} · יעד ${c.target_quantity}</div>
-          <span class="tag ${cls}">${t}</span>
+          <div><b>${escapeHtml(c.platform)}</b> · ${escapeHtml(c.action_type)} · ${target}</div>
+          <span class="tag ${cls}">${escapeHtml(t)}</span>
         </div>
-        <div class="url">${c.target_url}</div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-        <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-          <span class="muted">${c.success_count}/${c.target_quantity} אומתו · ${c.failed_count} נכשלו</span>
-          <button class="sm ghost" onclick="campaignAction('${c.id}','pause')">השהה</button>
-          <button class="sm ghost" onclick="campaignAction('${c.id}','cancel')">בטל</button>
+        <div class="url">${escapeHtml(c.target_url)}</div>
+        ${progress}
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="muted">${escapeHtml(resultCount)}</span>
+          <button class="sm ghost" onclick="campaignAction('${escapeHtml(c.id)}','${pauseAction}')">${pauseLabel}</button>
+          <button class="sm ghost" onclick="campaignAction('${escapeHtml(c.id)}','cancel')">בטל</button>
         </div>
+        <details><summary>משימות ושגיאות</summary><div id="tasks-${escapeHtml(c.id)}" class="muted">לחץ כדי לטעון משימות</div></details>
       </div>`;
     }).join('') : '<div class="muted">אין קמפיינים עדיין</div>';
-  }catch(e){ $('list').innerHTML = `<div class="muted">${e.message}</div>`; }
+  }catch(e){ $('list').innerHTML = `<div class="muted">${escapeHtml(e.message)}</div>`; }
 }
 
-async function campaignAction(id, a){ try{ await call(`/api/campaigns/${id}/${a}`,{method:'POST'}); loadAll(); }catch(e){ alert(e.message); } }
+async function loadTasks(id){
+  const node = $(`tasks-${id}`);
+  if(!node) return;
+  node.textContent = 'טוען משימות...';
+  try{
+    const tasks = await call(`/api/campaigns/${encodeURIComponent(id)}/tasks`);
+    node.innerHTML = tasks.length ? tasks.map(task => `
+      <div class="item">
+        <div>${escapeHtml(task.action_type)} · ${escapeHtml(task.status)} · ניסיונות ${task.attempts}</div>
+        ${task.account_id ? `<div class="muted">חשבון: ${escapeHtml(task.account_id)}</div>` : ''}
+        ${task.error ? `<div class="task-error">${escapeHtml(task.error)}</div>` : ''}
+      </div>`).join('') : 'אין משימות';
+  }catch(e){ node.textContent = e.message; }
+}
+
+async function campaignAction(id, action){ try{ await call(`/api/campaigns/${id}/${action}`,{method:'POST'}); loadAll(); }catch(e){ alert(e.message); } }
 
 async function loadAccounts(){
   try{
     const accs = await call('/api/accounts');
     $('accounts').innerHTML = accs.length ? accs.map(a=>
-      `<div class="item"><div class="top"><div>${a.platform} · ${a.email}</div><span class="tag">${a.status}</span></div></div>`
+      `<div class="item"><div class="top"><div>${escapeHtml(a.platform)} · ${escapeHtml(a.email)}</div><span class="tag">${escapeHtml(a.status)}</span></div>${a.last_error ? `<div class="task-error">${escapeHtml(a.last_error)}</div>` : ''}</div>`
     ).join('') : 'אין חשבונות';
-  }catch(e){ $('accounts').innerHTML = e.message; }
+  }catch(e){ $('accounts').textContent = e.message; }
 }
+
+$('list').addEventListener('toggle', event => {
+  if (event.target.matches('details[open]')) {
+    const id = event.target.querySelector('[id^="tasks-"]')?.id.slice(6);
+    if (id) loadTasks(id);
+  }
+}, true);
 
 loadAll(); loadAccounts();
 setInterval(loadAll, 8000);

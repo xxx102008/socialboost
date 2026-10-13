@@ -15,11 +15,11 @@ class Settings(BaseSettings):
 
     headless: bool = True
 
-    # חשוב ל-Free tier: 1 worker = פחות זיכרון
+    # Keep the default to a single browser worker for memory-constrained hosts.
     worker_concurrency: int = 1
     worker_poll_seconds: int = 3
 
-    # חוסך זיכרון וזמן - לא טוען תמונות/פונטים
+    # Avoid downloading large assets that are not needed for browser actions.
     block_heavy_assets: bool = True
 
     step_timeout_ms: int = 30000

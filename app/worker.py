@@ -1,6 +1,7 @@
 import json
 import threading
 import traceback
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
@@ -23,6 +24,40 @@ from .security import encrypt
 settings = get_settings()
 _claim_lock = threading.Lock()
 
+ARG_SETS = [
+    [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+        "--no-zygote",
+        "--js-flags=--max-old-space-size=160",
+    ],
+    ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+]
+
+
+def log(*parts):
+    print("[SB]", *parts, flush=True)
+
+
+def launch_browser():
+    """Try the low-memory launch flags first, then retry with standard flags."""
+    from playwright.sync_api import sync_playwright
+
+    playwright = sync_playwright().start()
+    last_error = None
+    for args in ARG_SETS:
+        try:
+            browser = playwright.chromium.launch(headless=settings.headless, args=args)
+            log("browser launched with", args[:3])
+            return playwright, browser
+        except Exception as exc:
+            last_error = exc
+            log("browser launch failed:", type(exc).__name__, str(exc))
+    playwright.stop()
+    raise RuntimeError(f"לא הצלחתי להפעיל דפדפן: {last_error}") from last_error
+
 
 def _now():
     return datetime.now(timezone.utc)
@@ -41,21 +76,7 @@ class Worker(threading.Thread):
 
     def _browser_instance(self):
         if self._browser is None:
-            from playwright.sync_api import sync_playwright
-
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
-                headless=settings.headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                    "--no-zygote",
-                    "--js-flags=--max-old-space-size=160",
-                ],
-            )
+            self._pw, self._browser = launch_browser()
         return self._browser
 
     def _context(self, account=None):
@@ -87,6 +108,7 @@ class Worker(threading.Thread):
         return context
 
     def run(self):
+        log(f"worker-{self.index} started")
         try:
             while not self._stop_event.is_set():
                 try:
@@ -107,9 +129,10 @@ class Worker(threading.Thread):
                     self._pw.stop()
                 except Exception:
                     pass
+            log(f"worker-{self.index} stopped")
 
     def _tick(self) -> bool:
-        """Atomically claim a queued task, or enqueue one unit for an unlimited campaign."""
+        """Claim a queued task, or enqueue work for an unlimited campaign."""
         with _claim_lock:
             db = SessionLocal()
             try:
@@ -169,6 +192,7 @@ class Worker(threading.Thread):
             finally:
                 db.close()
 
+        log(f"worker-{self.index} claimed task {task_id[:8]}")
         db = SessionLocal()
         try:
             task = db.get(Task, task_id)
@@ -186,6 +210,7 @@ class Worker(threading.Thread):
             task.error = "הקמפיין של המשימה לא נמצא"
             task.finished_at = _now()
             db.commit()
+            log(f"FAIL task {task.id[:8]} :: campaign not found")
             return
 
         account = db.get(Account, task.account_id) if task.account_id else None
@@ -194,12 +219,15 @@ class Worker(threading.Thread):
         campaign_id = campaign.id
         try:
             if account is None:
+                log(f"creating account for {campaign.platform} ...")
                 account = self._create_account(db, campaign.platform)
                 task.account_id = account.id
                 db.commit()
+                log(f"account {account.email} status={account.status} err={account.last_error}")
                 if account.status != AccountStatus.active:
                     raise RuntimeError(f"יצירת חשבון נכשלה: {account.last_error}")
 
+            log(f"performing {task.action_type} on {task.target_url[:60]}")
             context = self._context(account)
             result = get_platform(campaign.platform).perform(
                 context, task.action_type, task.target_url, account, campaign.comment_text
@@ -215,16 +243,18 @@ class Worker(threading.Thread):
             task.error = None
             task.finished_at = _now()
             db.commit()
+            log(f"SUCCESS task {task.id[:8]} -> {result}")
         except Exception as exc:
             db.rollback()
             task = db.get(Task, task_id)
             if task is not None:
-                task.error = str(exc)[:2000]
+                task.error = str(exc)[:3000]
                 task.status = (
                     TaskStatus.failed if task.attempts >= task.max_attempts else TaskStatus.retry
                 )
                 task.finished_at = _now() if task.status == TaskStatus.failed else None
                 db.commit()
+                log(f"FAIL task {task.id[:8]} :: {task.error}")
         finally:
             if context is not None:
                 try:
@@ -234,9 +264,43 @@ class Worker(threading.Thread):
             campaign = db.get(Campaign, campaign_id)
             if campaign is not None:
                 recompute_campaign(db, campaign)
+                self._refill(db, campaign)
+
+    def _refill(self, db, campaign: Campaign):
+        """Keep a small, bounded task buffer for unlimited campaigns."""
+        if not campaign.unlimited or campaign.status != CampaignStatus.running:
+            return
+
+        with _claim_lock:
+            active = db.scalar(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.campaign_id == campaign.id,
+                    Task.status.in_([TaskStatus.pending, TaskStatus.retry, TaskStatus.running]),
+                )
+            ) or 0
+            buffer_size = max(settings.worker_concurrency * 2, 2)
+            added = 0
+            while active < buffer_size:
+                db.add(
+                    Task(
+                        campaign_id=campaign.id,
+                        account_id=None,
+                        action_type=campaign.action_type,
+                        target_url=campaign.target_url,
+                        idempotency_key=f"{campaign.id}:u{uuid.uuid4().hex[:10]}",
+                    )
+                )
+                active += 1
+                added += 1
+            if added:
+                db.commit()
+                log(f"refilled unlimited campaign {campaign.id[:8]} with {added} task(s)")
 
     def _create_account(self, db, platform) -> Account:
         mailbox = create_mailbox()
+        log(f"mailbox created: {mailbox.address}")
         local = mailbox.address.split("@")[0][:8]
         account = Account(
             platform=platform,
@@ -256,7 +320,7 @@ class Worker(threading.Thread):
             account.status = AccountStatus.active
             account.last_error = None
         except Exception as exc:
-            account.last_error = str(exc)[:1000]
+            account.last_error = str(exc)[:2000]
             account.status = AccountStatus.error
         finally:
             context.close()
@@ -273,7 +337,6 @@ class WorkerPool:
         ]
 
     def start(self):
-        # Requeue interrupted work once, before any worker begins claiming tasks.
         db = SessionLocal()
         try:
             for task in db.scalars(select(Task).where(Task.status == TaskStatus.running)):

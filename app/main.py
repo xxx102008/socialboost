@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .db import Base, engine, ensure_campaign_unlimited_column, get_db
+from .db import Base, SessionLocal, engine, ensure_campaign_unlimited_column, get_db
 from .models import (
     Account,
     AccountStatus,
@@ -41,6 +41,7 @@ app.add_middleware(
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+BUILD = "v3-selftest"
 pool: WorkerPool | None = None
 
 
@@ -65,6 +66,69 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/version")
+def version():
+    return {"build": BUILD}
+
+
+@app.get("/api/debug/selftest")
+def selftest():
+    """Check temporary mail, Playwright/YouTube reachability, and database access."""
+    from .mail import create_mailbox
+
+    output = {"build": BUILD, "checks": {}}
+
+    try:
+        mailbox = create_mailbox()
+        output["checks"]["tempmail"] = {"ok": True, "address": mailbox.address}
+    except Exception as exc:
+        output["checks"]["tempmail"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    playwright = browser = context = None
+    try:
+        from .worker import launch_browser
+
+        playwright, browser = launch_browser()
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=45000)
+        output["checks"]["browser"] = {"ok": True, "title": page.title()}
+    except Exception as exc:
+        output["checks"]["browser"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        for resource in (context, browser, playwright):
+            if resource is not None:
+                try:
+                    resource.close() if resource is not playwright else resource.stop()
+                except Exception:
+                    pass
+
+    db = None
+    try:
+        db = SessionLocal()
+        output["checks"]["db"] = {
+            "ok": True,
+            "campaigns": db.scalar(select(func.count()).select_from(Campaign)),
+            "accounts": db.scalar(select(func.count()).select_from(Account)),
+        }
+    except Exception as exc:
+        output["checks"]["db"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if db is not None:
+            db.close()
+
+    return output
 
 
 @app.post("/api/campaigns", response_model=CampaignOut)

@@ -157,3 +157,45 @@ def test_run_step_includes_name_url_and_exception_type():
     assert "https://example.test/video" in message
     assert "TimeoutError" in message
     assert "locator did not appear" in message
+
+
+def test_launch_browser_retries_with_fallback_args(monkeypatch):
+    from playwright import sync_api
+
+    class FakeChromium:
+        def __init__(self):
+            self.calls = []
+
+        def launch(self, headless, args):
+            self.calls.append((headless, args))
+            if len(self.calls) == 1:
+                raise RuntimeError("single-process unsupported")
+            return browser
+
+    class FakePlaywright:
+        def __init__(self):
+            self.chromium = FakeChromium()
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    browser = object()
+    fake = FakePlaywright()
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: FakePlaywrightManager(fake))
+
+    class FakePlaywrightManager:
+        def __init__(self, instance):
+            self.instance = instance
+
+        def start(self):
+            return self.instance
+
+    playwright, launched_browser = worker_module.launch_browser()
+
+    assert playwright is fake
+    assert launched_browser is browser
+    assert len(fake.chromium.calls) == 2
+    assert fake.chromium.calls[0][1] == worker_module.ARG_SETS[0]
+    assert fake.chromium.calls[1][1] == worker_module.ARG_SETS[1]
+    assert fake.stopped is False
